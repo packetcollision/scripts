@@ -1,19 +1,75 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+set -euo pipefail
+
 # find base dir so we can call helpers
 base_dir="$( cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 ; pwd -P )"
 
 #include all the common functions
 source "${base_dir}/helpers.sh"
 
-[ -z ${1+x} ] && fatal "you must specify a branch name"
 is_git_tree
 
-main_branch="$(main_branch)"
-git branch -l "$1" | grep -q "$1" && fatal "Branch alredy exists"
+function usage() {
+  cat <<'USAGE'
+Usage: git start <branch-name>
 
-info "Syncing first..."
-git sync
+Create a local branch from the repo integration branch and configure the
+prefixed remote branch to use on first push.
 
-git checkout "${main_branch}"
+Config:
+  mwu.remote        Remote to use. Defaults to origin.
+  mwu.branchPrefix  Remote branch prefix. Defaults to your computer username.
+USAGE
+}
 
-git checkout -b "$1"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+[[ $# -eq 1 ]] || fatal "Usage: git start <branch-name>"
+
+branch="$1"
+remote="$(git_scripts_remote)"
+prefix="$(git_scripts_branch_prefix)"
+
+[[ -n "$branch" ]] || fatal "Branch name cannot be empty."
+[[ "$branch" != -* ]] || fatal "Branch name cannot start with '-'."
+[[ -n "$remote" ]] || fatal "Configured remote cannot be empty. Set mwu.remote or unset it to use origin."
+
+if [[ -n "$prefix" && "$branch" == "$prefix/"* ]]; then
+  fatal "Use the local branch name without the '${prefix}/' prefix: ${branch#"$prefix/"}"
+fi
+
+remote_branch="$branch"
+if [[ -n "$prefix" ]]; then
+  remote_branch="${prefix}/${branch}"
+fi
+
+git check-ref-format --branch "$branch" >/dev/null || fatal "Invalid branch name: ${branch}"
+git check-ref-format --branch "$remote_branch" >/dev/null || fatal "Invalid remote branch name: ${remote_branch}"
+
+require_clean_worktree
+
+git remote get-url "$remote" >/dev/null 2>&1 || fatal "Remote '${remote}' is not configured. Set mwu.remote or add the remote."
+
+local_branch_exists "$branch" && fatal "Local branch already exists: ${branch}"
+
+info "Fetching ${remote}..."
+git fetch "$remote" --prune
+
+base_branch="$(integration_branch_for_remote "$remote")"
+
+local_branch_exists "$branch" && fatal "Local branch already exists after fetch: ${branch}"
+remote_branch_exists "$remote" "$remote_branch" && fatal "Remote branch already exists: ${remote}/${remote_branch}"
+
+info "Creating ${branch} from ${remote}/${base_branch}..."
+git switch --quiet --no-track -c "$branch" "$remote/$base_branch"
+git config push.default upstream
+git config "branch.${branch}.remote" "$remote"
+git config "branch.${branch}.merge" "refs/heads/${remote_branch}"
+
+success "Started ${branch}"
+printf "  local:    %s\n" "$branch"
+printf "  upstream: %s/%s (created on first git push)\n" "$remote" "$remote_branch"
+printf "  base:     %s/%s\n" "$remote" "$base_branch"
