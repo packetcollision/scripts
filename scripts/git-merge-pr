@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# find base dir so we can call helpers
+base_dir="$( cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 ; pwd -P )"
+
+#include all the common functions
+source "${base_dir}/helpers.sh"
+
+is_git_tree
+
+function usage() {
+  cat <<'USAGE'
+Usage: git merge-pr <pr-number>
+
+Merge a pull request's local branch into its base branch with --no-ff, then
+push the updated base branch.
+
+The PR head branch is read from `gh pr view`. If it starts with
+mwu.branchPrefix, that prefix is removed to find the local branch.
+
+Config:
+  mwu.remote        Remote to fetch and push. Defaults to origin.
+  mwu.branchPrefix  Remote branch prefix. Defaults to your computer username.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+[[ $# -eq 1 ]] || fatal "Usage: git merge-pr <pr-number>"
+
+pr_number="$1"
+remote="$(git_scripts_remote)"
+prefix="$(git_scripts_branch_prefix)"
+
+[[ "$pr_number" =~ ^[0-9]+$ ]] || fatal "PR number must be numeric: ${pr_number}"
+[[ -n "$remote" ]] || fatal "Configured remote cannot be empty. Set mwu.remote or unset it to use origin."
+command -v gh >/dev/null 2>&1 || fatal "gh is required to read PR information."
+git remote get-url "$remote" >/dev/null 2>&1 || fatal "Remote '${remote}' is not configured. Set mwu.remote or add the remote."
+
+require_clean_worktree
+
+info "Reading PR #${pr_number}..."
+if ! pr_info="$(gh pr view "$pr_number" --json baseRefName,headRefName,headRefOid --jq '[.baseRefName, .headRefName, .headRefOid] | @tsv')"; then
+  fatal "Could not read PR #${pr_number} with gh."
+fi
+
+IFS=$'\t' read -r base_branch head_branch head_oid <<< "$pr_info"
+
+[[ -n "$base_branch" ]] || fatal "PR #${pr_number} did not include a base branch."
+[[ -n "$head_branch" ]] || fatal "PR #${pr_number} did not include a head branch."
+[[ -n "$head_oid" ]] || fatal "PR #${pr_number} did not include a head commit."
+
+local_branch="$head_branch"
+if [[ -n "$prefix" && "$local_branch" == "$prefix/"* ]]; then
+  local_branch="${local_branch#"$prefix/"}"
+fi
+
+git check-ref-format --branch "$base_branch" >/dev/null || fatal "Invalid PR base branch name: ${base_branch}"
+git check-ref-format --branch "$local_branch" >/dev/null || fatal "Invalid local branch name derived from PR head '${head_branch}': ${local_branch}"
+
+current_branch="$(cur_branch)"
+[[ -n "$current_branch" ]] || fatal "You must be on the PR base branch, not a detached HEAD."
+[[ "$current_branch" == "$base_branch" ]] || fatal "You are on '${current_branch}', but PR #${pr_number} targets '${base_branch}'."
+
+local_branch_exists "$local_branch" || fatal "Local branch '${local_branch}' does not exist for PR head '${head_branch}'."
+
+info "Fetching ${remote}..."
+git fetch "$remote" --prune
+
+remote_branch_exists "$remote" "$base_branch" || fatal "Remote base branch '${remote}/${base_branch}' does not exist after fetch."
+
+current_oid="$(git rev-parse HEAD)"
+remote_base_oid="$(git rev-parse "${remote}/${base_branch}")"
+local_head_oid="$(git rev-parse "$local_branch")"
+
+[[ "$current_oid" == "$remote_base_oid" ]] || fatal "Local '${base_branch}' is at ${current_oid}, but '${remote}/${base_branch}' is at ${remote_base_oid}. Update ${base_branch} before merging."
+[[ "$local_head_oid" == "$head_oid" ]] || fatal "Local '${local_branch}' is at ${local_head_oid}, but PR #${pr_number} head is ${head_oid}. Update the local branch before merging."
+
+info "Merging ${local_branch} into ${base_branch} with --no-ff..."
+git merge --no-ff -m "Merge PR #${pr_number}" "$local_branch"
+
+info "Pushing ${base_branch} to ${remote}..."
+git push "$remote" "HEAD:${base_branch}"
+
+success "Merged PR #${pr_number}"
+printf "  base:   %s (%s)\n" "$base_branch" "$remote_base_oid"
+printf "  branch: %s (from %s)\n" "$local_branch" "$head_branch"
+printf "  pushed: %s/%s\n" "$remote" "$base_branch"
