@@ -137,8 +137,28 @@ function test_merges_no_ff_and_pushes_base() {
   [[ "$(git -C "$work" log -1 --format=%s)" == "Merge PR #123" ]]
   [[ "$(git -C "$work" rev-parse main)" == "$(git -C "$work" rev-parse origin/main)" ]]
   assert_contains "$out" "Merged PR #123"
-  assert_contains "$out" "branch: feature/pr-123 (from enelson/feature/pr-123)"
+  assert_contains "$out" "merged: origin/enelson/feature/pr-123 (enelson/feature/pr-123)"
   assert_contains "$out" "pushed: origin/main"
+}
+
+function test_merges_without_local_branch() {
+  local remote work out head_oid merge_parent_count
+  remote="$(new_remote no-local)"
+  work="$(clone_remote "$remote" no-local-work)"
+  add_pr_branch "$work" "feature/pr-123" "enelson/feature/pr-123"
+  head_oid="$(git -C "$work" rev-parse feature/pr-123)"
+  git -C "$work" branch -D feature/pr-123 >/dev/null
+  install_mock_gh "main" "enelson/feature/pr-123" "$head_oid"
+  out="$(output_file)"
+
+  git -C "$work" merge-pr 123 >"$out" 2>&1
+
+  merge_parent_count="$(git -C "$work" rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')"
+  [[ "$merge_parent_count" == "3" ]]
+  [[ "$(git -C "$work" log -1 --format=%s)" == "Merge PR #123" ]]
+  [[ "$(git -C "$work" rev-parse main)" == "$(git -C "$work" rev-parse origin/main)" ]]
+  assert_contains "$out" "Merged PR #123"
+  assert_contains "$out" "merged: origin/enelson/feature/pr-123 (enelson/feature/pr-123)"
 }
 
 function test_refuses_wrong_current_branch() {
@@ -181,35 +201,32 @@ function test_refuses_stale_base() {
   assert_contains "$out" "Local 'main' is at ${base_oid}, but 'origin/main' is at ${remote_base_oid}."
 }
 
-function test_refuses_stale_local_head() {
-  local remote work out head_oid
+function test_refuses_stale_head_oid() {
+  local remote work out
   remote="$(new_remote stale-head)"
   work="$(clone_remote "$remote" stale-head-work)"
   add_pr_branch "$work" "feature/pr-123" "enelson/feature/pr-123"
-  head_oid="$(git -C "$work" rev-parse feature/pr-123)"
-  git -C "$work" switch --quiet feature/pr-123
-  printf "local extra\n" >> "${work}/feature.txt"
-  git -C "$work" add feature.txt
-  git -C "$work" commit -m "local extra" >/dev/null
-  git -C "$work" switch --quiet main
-  install_mock_gh "main" "enelson/feature/pr-123" "$head_oid"
+  # gh reports an older head than what is actually on the remote, simulating a
+  # PR head that advanced after gh read it.
+  install_mock_gh "main" "enelson/feature/pr-123" "$(git -C "$work" rev-parse main)"
   out="$(output_file)"
 
   if git -C "$work" merge-pr 123 >"$out" 2>&1; then
     return 1
   fi
 
-  assert_contains "$out" "Local 'feature/pr-123' is at"
-  assert_contains "$out" "but PR #123 head is ${head_oid}"
+  assert_contains "$out" "'origin/enelson/feature/pr-123' is at"
+  assert_contains "$out" "but PR #123 head is"
 }
 
-function test_refuses_missing_local_branch() {
+function test_refuses_when_head_not_found() {
   local remote work out head_oid
-  remote="$(new_remote missing-local)"
-  work="$(clone_remote "$remote" missing-local-work)"
+  remote="$(new_remote no-head)"
+  work="$(clone_remote "$remote" no-head-work)"
   add_pr_branch "$work" "feature/pr-123" "enelson/feature/pr-123"
   head_oid="$(git -C "$work" rev-parse feature/pr-123)"
   git -C "$work" branch -D feature/pr-123 >/dev/null
+  git -C "$work" push origin --delete enelson/feature/pr-123 >/dev/null 2>&1
   install_mock_gh "main" "enelson/feature/pr-123" "$head_oid"
   out="$(output_file)"
 
@@ -217,13 +234,33 @@ function test_refuses_missing_local_branch() {
     return 1
   fi
 
-  assert_contains "$out" "Local branch 'feature/pr-123' does not exist for PR head 'enelson/feature/pr-123'."
+  assert_contains "$out" "Could not find PR head 'enelson/feature/pr-123' on 'origin' or as a local branch 'feature/pr-123'."
+}
+
+function test_falls_back_to_local_branch() {
+  local remote work out head_oid
+  remote="$(new_remote local-fallback)"
+  work="$(clone_remote "$remote" local-fallback-work)"
+  add_pr_branch "$work" "feature/pr-123" "enelson/feature/pr-123"
+  head_oid="$(git -C "$work" rev-parse feature/pr-123)"
+  # Remove the remote head ref so the script must fall back to the local branch.
+  git -C "$work" push origin --delete enelson/feature/pr-123 >/dev/null 2>&1
+  git -C "$work" fetch origin --prune >/dev/null 2>&1
+  install_mock_gh "main" "enelson/feature/pr-123" "$head_oid"
+  out="$(output_file)"
+
+  git -C "$work" merge-pr 123 >"$out" 2>&1
+
+  [[ "$(git -C "$work" log -1 --format=%s)" == "Merge PR #123" ]]
+  assert_contains "$out" "merged: feature/pr-123 (enelson/feature/pr-123)"
 }
 
 run_test "merges --no-ff and pushes base" test_merges_no_ff_and_pushes_base
+run_test "merges without a local branch" test_merges_without_local_branch
 run_test "refuses wrong current branch" test_refuses_wrong_current_branch
 run_test "refuses stale base" test_refuses_stale_base
-run_test "refuses stale local head" test_refuses_stale_local_head
-run_test "refuses missing local branch" test_refuses_missing_local_branch
+run_test "refuses stale head oid" test_refuses_stale_head_oid
+run_test "refuses when head not found" test_refuses_when_head_not_found
+run_test "falls back to local branch" test_falls_back_to_local_branch
 
 printf "\n%d git-merge-pr tests passed.\n" "$test_count"

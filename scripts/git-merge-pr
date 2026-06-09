@@ -13,11 +13,13 @@ function usage() {
   cat <<'USAGE'
 Usage: git merge-pr <pr-number>
 
-Merge a pull request's local branch into its base branch with --no-ff, then
+Merge a pull request's head branch into its base branch with --no-ff, then
 push the updated base branch.
 
-The PR head branch is read from `gh pr view`. If it starts with
-mwu.branchPrefix, that prefix is removed to find the local branch.
+The PR head branch is read from `gh pr view` and merged from the remote
+tracking ref, so no matching local branch is required. If the remote head
+ref is unavailable, a matching local branch is used instead: when the head
+starts with mwu.branchPrefix, that prefix is stripped to find it.
 
 Config:
   mwu.remote        Remote to fetch and push. Defaults to origin.
@@ -60,33 +62,43 @@ if [[ -n "$prefix" && "$local_branch" == "$prefix/"* ]]; then
 fi
 
 git check-ref-format --branch "$base_branch" >/dev/null || fatal "Invalid PR base branch name: ${base_branch}"
-git check-ref-format --branch "$local_branch" >/dev/null || fatal "Invalid local branch name derived from PR head '${head_branch}': ${local_branch}"
+git check-ref-format --branch "$head_branch" >/dev/null || fatal "Invalid PR head branch name: ${head_branch}"
 
 current_branch="$(cur_branch)"
 [[ -n "$current_branch" ]] || fatal "You must be on the PR base branch, not a detached HEAD."
 [[ "$current_branch" == "$base_branch" ]] || fatal "You are on '${current_branch}', but PR #${pr_number} targets '${base_branch}'."
-
-local_branch_exists "$local_branch" || fatal "Local branch '${local_branch}' does not exist for PR head '${head_branch}'."
 
 info "Fetching ${remote}..."
 git fetch "$remote" --prune
 
 remote_branch_exists "$remote" "$base_branch" || fatal "Remote base branch '${remote}/${base_branch}' does not exist after fetch."
 
+# Prefer the PR head on the remote so no matching local branch is required.
+# Fall back to a local branch only if the remote head ref is unavailable.
+if remote_branch_exists "$remote" "$head_branch"; then
+  merge_ref="${remote}/${head_branch}"
+  merge_source="${remote}/${head_branch}"
+elif local_branch_exists "$local_branch"; then
+  merge_ref="$local_branch"
+  merge_source="$local_branch"
+else
+  fatal "Could not find PR head '${head_branch}' on '${remote}' or as a local branch '${local_branch}'. Fetch the PR branch before merging."
+fi
+
 current_oid="$(git rev-parse HEAD)"
 remote_base_oid="$(git rev-parse "${remote}/${base_branch}")"
-local_head_oid="$(git rev-parse "$local_branch")"
+merge_oid="$(git rev-parse "$merge_ref")"
 
 [[ "$current_oid" == "$remote_base_oid" ]] || fatal "Local '${base_branch}' is at ${current_oid}, but '${remote}/${base_branch}' is at ${remote_base_oid}. Update ${base_branch} before merging."
-[[ "$local_head_oid" == "$head_oid" ]] || fatal "Local '${local_branch}' is at ${local_head_oid}, but PR #${pr_number} head is ${head_oid}. Update the local branch before merging."
+[[ "$merge_oid" == "$head_oid" ]] || fatal "'${merge_source}' is at ${merge_oid}, but PR #${pr_number} head is ${head_oid}. Fetch the latest PR head before merging."
 
-info "Merging ${local_branch} into ${base_branch} with --no-ff..."
-git merge --no-ff -m "Merge PR #${pr_number}" "$local_branch"
+info "Merging ${merge_source} into ${base_branch} with --no-ff..."
+git merge --no-ff -m "Merge PR #${pr_number}" "$merge_ref"
 
 info "Pushing ${base_branch} to ${remote}..."
 git push "$remote" "HEAD:${base_branch}"
 
 success "Merged PR #${pr_number}"
 printf "  base:   %s (%s)\n" "$base_branch" "$remote_base_oid"
-printf "  branch: %s (from %s)\n" "$local_branch" "$head_branch"
+printf "  merged: %s (%s)\n" "$merge_source" "$head_branch"
 printf "  pushed: %s/%s\n" "$remote" "$base_branch"
